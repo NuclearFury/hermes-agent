@@ -102,6 +102,7 @@ Full definition in `providers/base.py`. The most useful ones:
 | `auth_type` | str | `api_key` \| `oauth_device_code` \| `oauth_external` \| `copilot` \| `aws_sdk` \| `external_process` |
 | `auth_handler` | `Callable \| None` | Provider-owned `hermes auth add/status/logout/refresh <name>` — see [Provider-owned auth](#provider-owned-auth-auth_handler-refresh_credential) |
 | `refresh_credential` | `Callable \| None` | Provider-owned rotation of a pooled OAuth row — same section |
+| `classify_api_error` | `Callable \| None` | Provider-scoped error-classification override — see [Recovery and error classification](#recovery-and-error-classification) |
 | `fallback_models` | `tuple[str, ...]` | Curated list shown when live catalog fetch fails — in the `/model` picker AND the first-time `hermes setup` / `hermes model` API-key flow, which resolve the catalog the same way (`fetch_models()` merged curated-first with `fallback_models`; `fallback_models` alone when the fetch returns `None` or raises) |
 | `supports_vision` | bool | Declares the endpoint accepts image input. Consumed by the tool-result media path and by the per-turn image-routing probe (`agent/image_routing.decide_image_input_mode`): an image attached to a model of a `supports_vision=True` plugin goes native instead of through `vision_analyze` text, unless a config override or a models.dev per-model entry says otherwise |
 | `default_headers` | `dict[str, str]` | Sent on every request (e.g. Copilot's `Editor-Version`); also forwarded by the default `fetch_models()` catalog request |
@@ -339,6 +340,35 @@ bundled provider's flow.
 Hermes passes the parsed namespace, not provider-declared flags: ask for provider-specific values
 interactively (or read your own config/env). Rows the plugin stores in the pool are its own — extra keys
 survive `load → save → load`, and Hermes passes no secrets beyond that pooled row to `refresh_credential`.
+
+## Recovery and error classification
+
+A `kind: model-provider` plugin is loaded by provider discovery, **not** by the generic plugin manager, so
+the `transform_api_error_classification` plugin hook is not reachable from it without shipping a second
+plugin component. The profile carries the equivalent seam instead:
+
+```python
+def classify(error, *, status_code, error_code, message, body, model):
+    # A vendor-specific 403 that is a spent plan, not a bad credential.
+    if status_code == 403 and error_code == "quota_exhausted":
+        return {"reason": "billing", "retryable": False, "should_rotate_credential": True, "should_fallback": True}
+    return None  # decline → built-in classification
+
+
+register_provider(ProviderProfile(name="example-oauth", auth_type="oauth_external",
+                                  base_url="https://api.example.com/v1",
+                                  refresh_credential=example_refresh, classify_api_error=classify))
+```
+
+| Contract | |
+|---|---|
+| `classify_api_error(error, *, status_code, error_code, message, body, model)` | Consulted by `agent.error_classifier.classify_api_error` for failures of **this provider only**, after any generic `transform_api_error_classification` hooks and before the built-in pipeline. `message` is the lower-cased error text, `body` the parsed JSON body (may be empty). Return `{"reason": <FailoverReason name>}` plus optional `retryable` / `should_compress` / `should_rotate_credential` / `should_fallback` / `error_context` to override; `None` (or an unknown reason) leaves the built-in verdict. Exceptions are swallowed and logged at DEBUG. The verdict drives the same recovery as for built-ins — e.g. `billing` benches the credential for the billing TTL instead of the transient 403 cooldown. |
+| 401 on a plugin credential | Handled by the credential pool, no core edit: the failing pooled row is refreshed through `refresh_credential` once per attempt (capped at two refreshes per row per session), the client is rebuilt with the rotated token and the request retried. A `None`/empty return or an exception benches the row — the request then rotates or falls to the generic "sign in again: `hermes auth add <name>`" copy, never to a built-in provider's guidance. |
+| Auxiliary calls | Auxiliary-client 401s take the same pool refresh (`try_refresh_current` → `refresh_credential`). |
+
+Recovery that remains name-keyed in core is behaviour with no safe generic shape (a provider-specific
+token store to re-sync, a plan-tier entitlement wall, a single-use refresh-token quarantine). A plugin
+that needs one of those owns it inside `refresh_credential` / `classify_api_error`.
 
 ## Discovery timing
 
