@@ -103,7 +103,7 @@ Full definition in `providers/base.py`. The most useful ones:
 | `auth_handler` | `Callable \| None` | Provider-owned `hermes auth add/status/logout/refresh <name>` — see [Provider-owned auth](#provider-owned-auth-auth_handler-refresh_credential) |
 | `refresh_credential` | `Callable \| None` | Provider-owned rotation of a pooled OAuth row — same section |
 | `fallback_models` | `tuple[str, ...]` | Curated list shown when live catalog fetch fails — in the `/model` picker AND the first-time `hermes setup` / `hermes model` API-key flow, which resolve the catalog the same way (`fetch_models()` merged curated-first with `fallback_models`; `fallback_models` alone when the fetch returns `None` or raises) |
-| `supports_vision` | bool | Declares the endpoint accepts image input. Consumed by the tool-result media path and by the per-turn image-routing probe (`agent/image_routing.decide_image_input_mode`): an image attached to a model of a `supports_vision=True` plugin goes native instead of through `vision_analyze` text, unless a config override or a models.dev per-model entry says otherwise |
+| `supports_vision` | bool | Declares the provider's API accepts image content inside **tool-result** messages (a provider-wide wire capability). Per-model user-image routing comes from `model_capabilities` / models.dev, not from this flag |
 | `default_headers` | `dict[str, str]` | Sent on every request (e.g. Copilot's `Editor-Version`); also forwarded by the default `fetch_models()` catalog request |
 | `fixed_temperature` | Any | `None` = use caller's value; `OMIT_TEMPERATURE` sentinel = don't send temperature at all (Kimi) |
 | `default_max_tokens` | `int \| None` | Provider-level max_tokens cap (Nvidia: 16384) |
@@ -275,7 +275,7 @@ Set `profile.api_mode` to match the default your provider ships — it acts as a
 | `aws_sdk` | AWS SDK credential chain (IAM role, profile, env) | `bedrock` plugin only |
 | `external_process` | Auth handled by a subprocess the agent spawns (see [External-process providers](#external-process-acp-providers)) | `copilot-acp` plugin, out-of-tree ACP plugins |
 
-Every profile is mirrored into Hermes' auth registry under the `auth_type` it declares, so `hermes auth`,
+Every profile is mirrored into Hermes' auth registry under the `auth_type` it declares (two exclusions: an `api_key` profile with empty `env_vars`, and the aggregator/user-supplied slugs `openrouter`/`custom` plus the bespoke-refresh built-ins `copilot`/`kimi-coding`/`zai`), so `hermes auth`,
 `--provider <name>` and runtime resolution accept it whatever its shape. What differs is who performs the
 login: `api_key` profiles get the built-in key prompt / env-var resolution; every other `auth_type` is
 **provider-owned** — the plugin ships the two hooks below, and a non-api-key profile without an
@@ -315,10 +315,10 @@ def example_auth(action: str, args) -> bool:
 
 
 def example_refresh(entry):
-    """Called by the credential pool with the pooled row; return the rotated fields or raise."""
-    tokens = post_refresh(entry.refresh_token)
+    """Called by the credential pool with the pooled row; return the rotated values, None, or raise."""
+    tokens = post_refresh(entry.refresh_token)          # the raw token-endpoint response is fine as-is
     return {"access_token": tokens["access_token"], "refresh_token": tokens["refresh_token"],
-            "expires_at_ms": tokens["expires_at_ms"]}
+            "expires_at_ms": tokens["expires_at_ms"], "expires_in": tokens["expires_in"]}
 
 
 register_provider(ProviderProfile(
@@ -328,8 +328,10 @@ register_provider(ProviderProfile(
 
 | Contract | |
 |---|---|
-| `auth_handler(action, args)` | `args` is the parsed `hermes auth` namespace. Truthy = handled (Hermes prints nothing more, exit 0); falsy = fall back to the built-in path **for that action**. An exception becomes `SystemExit("<provider> auth handler failed for `<action>`: …")`. |
-| `refresh_credential(entry)` | Receives the `PooledCredential`; returns a mapping of rotated fields (`access_token`, `refresh_token`, `expires_at_ms`, …) applied to the row, or raises (the pool benches the row). Its presence is what makes the provider *refreshable* — `hermes auth refresh <name>` and the 401 recovery paths (main loop and auxiliary client) call it; no core name list is involved. |
+| `auth_handler(action, args)` | `args` is the parsed `hermes auth` namespace for CLI actions; the interactive setup picker passes a minimal namespace carrying only `provider`, so read options with `getattr(args, name, None)`. Truthy = handled (Hermes prints nothing more, exit 0); falsy = fall back to the built-in path **for that action**. An exception becomes `SystemExit("<provider> auth handler failed for `&lt;action&gt;`: …")`. |
+| `refresh_credential(entry)` | Receives the `PooledCredential`; returns a mapping of rotated values or `None`. Keys that are `PooledCredential` fields (`access_token`, `refresh_token`, `expires_at_ms`, …) replace the row's fields; every other key (`expires_in`, `token_type`, `scope` — the raw token-endpoint shape) lands in `entry.extra` and round-trips through `auth.json`. `None` = no rotation happened, the row is marked ok. Its presence is what makes the provider *refreshable* — `hermes auth refresh <name>` and the main-loop 401 recovery call it through the pool with no core name list involved; the auxiliary client's 401 recovery reaches it only for pooled rows it already treats as recoverable (api-key rows and the built-in OAuth routes). |
+| Refresh failures | Raise `hermes_cli.auth_constants.AuthError(..., relogin_required=True)` (or with `code` `invalid_grant` / `invalid_token` / `refresh_token_reused`) when the grant is dead: the row goes **DEAD**, leaves rotation and Hermes logs a WARNING naming `hermes auth add <name>`. Any other exception (network, 429, 5xx) is transient — the row is benched for one cooldown and retried. |
+| Concurrency | The hook runs under the shared `auth.json` lock. Before calling it the pool re-reads the row; if another Hermes process (gateway + CLI, two profiles) already rotated the pair, that pair is adopted and your hook is **not** called — safe for single-use refresh tokens. After the hook returns, the rotated row is written through to `auth.json`. |
 | No hooks | `api_key` profiles behave exactly as before. Any other `auth_type` without `auth_handler` fails loud on `hermes auth add`. |
 
 `hermes auth add|status|logout|refresh <provider>` consults the handler **first** — before the built-in
